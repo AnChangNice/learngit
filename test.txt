@@ -1,3 +1,5 @@
 https://github.com/AnChangNice/learngit.git
 
 newDev branch Edit!
+
+Creating a new branch is quick AND simple.
