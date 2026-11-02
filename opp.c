@@ -1,4 +1,4 @@
-/* opp.c - OPP shell commands */
+/* opp.c - Bluetooth Object Push Profile handling */
 
 /*
  * Copyright 2026 NXP
@@ -9,1143 +9,1366 @@
 #include <errno.h>
 #include <zephyr/types.h>
 #include <stddef.h>
-#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <zephyr/kernel.h>
-#include <zephyr/shell/shell.h>
+
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
-#include <zephyr/bluetooth/classic/sdp.h>
-#include <zephyr/bluetooth/classic/obex.h>
+#include <zephyr/bluetooth/l2cap.h>
+#include <zephyr/bluetooth/classic/rfcomm.h>
+#include <zephyr/bluetooth/classic/goep.h>
 #include <zephyr/bluetooth/classic/opp.h>
 
-#include <host/shell/bt.h>
-#include <common/bt_shell_private.h>
+#include "opp_internal.h"
 
-struct opp_shell_body_print_data {
-	const char *prefix;
-	bool found;
+#define LOG_LEVEL CONFIG_BT_OPP_LOG_LEVEL
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(bt_opp);
+
+/* Buffer pool: two buffers per ACL connection (one for operation, one for response). */
+#define OPP_POOL_BUF_SIZE BT_RFCOMM_BUF_SIZE(CONFIG_BT_GOEP_RFCOMM_MTU)
+
+NET_BUF_POOL_FIXED_DEFINE(bt_opp_pool, 2 * CONFIG_BT_MAX_CONN, OPP_POOL_BUF_SIZE,
+			  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+
+/*
+ * OPP spec Table 5.2 and Table 5.3 mark these headers as excluded (X), a
+ * capability that the unit may support but shall never use in the profile.
+ *
+ * Single Response Mode and its parameters are IrOBEX 1.5 features. The OPP ICS
+ * only allows those for OPP v1.2 (with v1.2.1) and excludes them for OPP v1.1,
+ * so this OPP v1.1 implementation does not use them either. The same holds for
+ * the Session headers of a reliable session, which the profile has no
+ * operation for.
+ */
+static const uint8_t opp_excluded_hdrs[] = {
+	BT_OBEX_HEADER_ID_COUNT,
+	BT_OBEX_HEADER_ID_TARGET,
+	BT_OBEX_HEADER_ID_WHO,
+	BT_OBEX_HEADER_ID_CONN_ID,
+	BT_OBEX_HEADER_ID_APP_PARAM,
+	BT_OBEX_HEADER_ID_AUTH_CHALLENGE,
+	BT_OBEX_HEADER_ID_AUTH_RSP,
+	BT_OBEX_HEADER_ID_OBJECT_CLASS,
+	BT_OBEX_HEADER_ID_SRM,
+	BT_OBEX_HEADER_ID_SRM_PARAM,
+	BT_OBEX_HEADER_ID_SESSION_PARAM,
+	BT_OBEX_HEADER_ID_SESSION_SEQ_NUM,
 };
 
-static bool opp_shell_print_body_header(struct bt_obex_hdr *hdr, void *user_data)
+/*
+ * Check a buffer this device is about to send for a header the profile does not
+ * use. An application builds the headers of a request or a response itself, so
+ * this is what keeps it from putting OPP on the air with headers that OPP
+ * excludes.
+ */
+static bool opp_has_excluded_header(struct net_buf *buf)
 {
-	struct opp_shell_body_print_data *data = user_data;
-	const char *kind;
-
-	if (hdr->id != BT_OBEX_HEADER_ID_BODY && hdr->id != BT_OBEX_HEADER_ID_END_BODY) {
-		return true;
+	if (buf == NULL) {
+		return false;
 	}
 
-	data->found = true;
-	kind = (hdr->id == BT_OBEX_HEADER_ID_END_BODY) ? "final body" : "body chunk";
-	if (hdr->len > 0) {
-		bt_shell_print("%s %s (%u bytes):\n%.*s", data->prefix, kind, hdr->len,
-			       (int)hdr->len, hdr->data);
+	ARRAY_FOR_EACH(opp_excluded_hdrs, i) {
+		if (bt_obex_has_header(buf, opp_excluded_hdrs[i])) {
+			LOG_ERR("OBEX header (0x%02x) is not used by OPP", opp_excluded_hdrs[i]);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool opp_type_is_vcard(uint16_t len, const uint8_t *type)
+{
+	const uint8_t *sep;
+	uint16_t media_len;
+
+	if (len == 0U) {
+		return false;
+	}
+
+	/*
+	 * IrOBEX 1.2 section 2.2.3: the Type header holds null terminated ASCII
+	 * text and its value is matched case insensitively, which is why
+	 * section 8.4.1 can spell the same type "text/x-vCard". An OBEX byte
+	 * sequence is not implicitly terminated though, and the value may carry
+	 * MIME parameters, so only the media type is compared: the bytes up to
+	 * the terminator, a ';' or the end of the header value, whichever comes
+	 * first. That also bounds the comparison below to the header.
+	 */
+	sep = memchr(type, '\0', len);
+	media_len = (sep != NULL) ? (uint16_t)(sep - type) : len;
+
+	sep = memchr(type, ';', media_len);
+	if (sep != NULL) {
+		media_len = (uint16_t)(sep - type);
+	}
+
+	if (media_len != strlen(BT_OPP_TYPE_VCARD)) {
+		return false;
+	}
+
+	return strncasecmp((const char *)type, BT_OPP_TYPE_VCARD, media_len) == 0;
+}
+
+/*
+ * Check the headers of a GET request against the only object the Push Server
+ * serves, the Default Get Object (owner's business card). Both roles share this
+ * so that a request this client sends is one this server would accept.
+ *
+ * Returns 0 when the request addresses the Default Get Object, or the response
+ * code that rejects it.
+ */
+static uint8_t opp_pull_req_check(struct net_buf *buf)
+{
+	const uint8_t *name;
+	const uint8_t *type;
+	uint16_t name_len = 0;
+	uint16_t type_len = 0;
+
+	/*
+	 * IrOBEX 1.2 section 8.4: the Default Get Object is requested with an
+	 * empty Name header, and an empty Name header is treated the same as no
+	 * Name header. Per section 2.2.2 an empty Name header carries no value,
+	 * so name_len is 0. A peer that sends the UTF-16BE null terminator on
+	 * its own gives name_len 2 instead. Both mean empty and are treated the
+	 * same as absent, so only a longer value counts as a real name. Naming
+	 * an object is answered with FORBIDDEN by both section 8.4 and OPP spec
+	 * section 5.6.
+	 */
+	if (bt_obex_get_header_name(buf, &name_len, &name) == 0 && name_len > 2) {
+		LOG_WRN("GET names an object, which OPP does not support");
+		return BT_OPP_RSP_CODE_FORBIDDEN;
+	}
+
+	/*
+	 * An absent Type header is accepted here for two reasons: a continuation
+	 * request of a pull operation carries no headers at all, and per IrOBEX
+	 * 1.2 section 3.3.4 a server with a single object may serve it to a
+	 * request that does not describe it. The first request this client sends
+	 * does have to carry the header, which bt_opp_client_pull() enforces.
+	 *
+	 * IrOBEX 1.2 section 8.4: a default object of the requested type that
+	 * the server does not have is answered with NOT FOUND, which is what
+	 * any object format other than vCard amounts to for a Push Server.
+	 */
+	if (bt_obex_get_header_type(buf, &type_len, &type) == 0 &&
+	    !opp_type_is_vcard(type_len, type)) {
+		LOG_WRN("GET asks for an object format other than vCard");
+		return BT_OPP_RSP_CODE_NOT_FOUND;
+	}
+
+	return 0;
+}
+
+#if defined(CONFIG_BT_OPP_CLIENT)
+
+/*
+ * Check the headers of the first PUT request this client sends in a push
+ * operation.
+ *
+ * Returns 0 when the request carries the Name and Length headers, or
+ * BT_OPP_RSP_CODE_BAD_REQ when one of them is missing. Only their presence is
+ * checked, not their value: an empty name, or one holding a path character
+ * that IrOBEX 1.2 section 4.3 does not accept for an inbox object, passes and
+ * is left to the Push Server to reject.
+ */
+static uint8_t opp_push_first_req_check(struct net_buf *buf)
+{
+	/*
+	 * OPP spec Table 5.2: the Name and Length headers of the Object Push
+	 * feature are mandatory for the Push Client. GOEP section 5.5.1,
+	 * Table 5.8, which OPP spec section 5.5 refers to, puts Name in the
+	 * first request of the operation. This client requires Length there
+	 * too, following the IrOBEX 1.2 section 3.3.3.1 recommendation that
+	 * the headers describing the object precede its Body. Later requests
+	 * do not repeat them.
+	 */
+	if (!bt_obex_has_header(buf, BT_OBEX_HEADER_ID_NAME)) {
+		LOG_WRN("PUT is missing the OBEX header (Name)");
+		return BT_OPP_RSP_CODE_BAD_REQ;
+	}
+
+	if (!bt_obex_has_header(buf, BT_OBEX_HEADER_ID_LEN)) {
+		LOG_WRN("PUT is missing the OBEX header (Length)");
+		return BT_OPP_RSP_CODE_BAD_REQ;
+	}
+
+	return 0;
+}
+
+/* GOEP transport ops for the client */
+static void opp_client_transport_connected(struct bt_conn *conn, struct bt_goep *goep)
+{
+	struct bt_opp_client *client = CONTAINER_OF(goep, struct bt_opp_client, _goep);
+
+	atomic_set(&client->_transport_state, BT_OPP_TRANSPORT_STATE_CONNECTED);
+
+	LOG_DBG("client %p transport connected", client);
+
+	client->cb->transport_connected(conn, client);
+}
+
+static void opp_client_transport_disconnected(struct bt_goep *goep)
+{
+	struct bt_opp_client *client = CONTAINER_OF(goep, struct bt_opp_client, _goep);
+
+	atomic_set(&client->_transport_state, BT_OPP_TRANSPORT_STATE_DISCONNECTED);
+	atomic_set(&client->_state, BT_OPP_STATE_DISCONNECTED);
+	atomic_clear(&client->_push_state);
+	atomic_clear(&client->_pull_state);
+
+	LOG_DBG("client %p transport disconnected", client);
+
+	client->cb->transport_disconnected(client);
+}
+
+static const struct bt_goep_transport_ops opp_client_goep_transport_ops = {
+	.connected    = opp_client_transport_connected,
+	.disconnected = opp_client_transport_disconnected,
+};
+
+/* OBEX client callback implementations */
+static void opp_client_obex_connect_cb(struct bt_obex_client *obex_client, uint8_t rsp_code,
+				       uint8_t version, uint16_t mopl, struct net_buf *buf)
+{
+	struct bt_opp_client *client = CONTAINER_OF(obex_client, struct bt_opp_client, _client);
+
+	/*
+	 * BT_OBEX_RSP_CODE_OK and BT_OBEX_RSP_CODE_SUCCESS share the same
+	 * numeric value; a single check is sufficient.
+	 */
+	if (rsp_code == BT_OBEX_RSP_CODE_SUCCESS) {
+		atomic_set(&client->_state, BT_OPP_STATE_CONNECTED);
 	} else {
-		bt_shell_print("%s %s (empty)", data->prefix, kind);
+		atomic_set(&client->_state, BT_OPP_STATE_DISCONNECTED);
 	}
+
+	LOG_DBG("client %p OBEX connect rsp 0x%02x version 0x%02x mopl %u", client, rsp_code,
+		version, mopl);
+
+	client->cb->connect(client, rsp_code, version, mopl, buf);
+}
+
+static void opp_client_obex_disconnect_cb(struct bt_obex_client *obex_client, uint8_t rsp_code,
+					  struct net_buf *buf)
+{
+	struct bt_opp_client *client = CONTAINER_OF(obex_client, struct bt_opp_client, _client);
+	int err;
+
+	if (rsp_code == BT_OBEX_RSP_CODE_SUCCESS) {
+		atomic_set(&client->_state, BT_OPP_STATE_DISCONNECTED);
+		atomic_clear(&client->_push_state);
+		atomic_clear(&client->_pull_state);
+	} else {
+		/*
+		 * IrOBEX 1.2 section 3.3.2: a disconnect may not be refused.
+		 * The OBEX layer leaves its own connection established on any
+		 * response code other than success, so follow it here and close
+		 * the transport below instead of carrying on with a peer that
+		 * does not follow the protocol.
+		 */
+		LOG_WRN("client %p disconnect refused with rsp 0x%02x", client, rsp_code);
+		atomic_set(&client->_state, BT_OPP_STATE_CONNECTED);
+	}
+
+	LOG_DBG("client %p OBEX disconnect rsp 0x%02x", client, rsp_code);
+
+	client->cb->disconnect(client, rsp_code, buf);
+
+	if (rsp_code != BT_OBEX_RSP_CODE_SUCCESS) {
+		err = bt_opp_client_transport_disconnect(client);
+		if (err != 0) {
+			LOG_WRN("client %p failed to close the transport (err %d)", client, err);
+		}
+	}
+}
+
+static void opp_client_obex_put_cb(struct bt_obex_client *obex_client, uint8_t rsp_code,
+				   struct net_buf *buf)
+{
+	struct bt_opp_client *client = CONTAINER_OF(obex_client, struct bt_opp_client, _client);
+
+	LOG_DBG("client %p PUT rsp 0x%02x", client, rsp_code);
+
+	/*
+	 * CONTINUE means the server expects the next packet of the same push
+	 * operation. Any other response code ends the operation, so the next
+	 * request has to describe a new object again.
+	 */
+	if (rsp_code != BT_OBEX_RSP_CODE_CONTINUE) {
+		atomic_clear(&client->_push_state);
+	}
+
+	client->cb->push(client, rsp_code, buf);
+}
+
+static void opp_client_obex_get_cb(struct bt_obex_client *obex_client, uint8_t rsp_code,
+				   struct net_buf *buf)
+{
+	struct bt_opp_client *client = CONTAINER_OF(obex_client, struct bt_opp_client, _client);
+
+	LOG_DBG("client %p GET rsp 0x%02x", client, rsp_code);
+
+	/*
+	 * CONTINUE means the server has more of the object to send. Any other
+	 * response code ends the operation, so the next request has to address
+	 * the Default Get Object again.
+	 */
+	if (rsp_code != BT_OBEX_RSP_CODE_CONTINUE) {
+		atomic_clear(&client->_pull_state);
+	}
+
+	if (client->cb->pull != NULL) {
+		client->cb->pull(client, rsp_code, buf);
+	}
+}
+
+static void opp_client_obex_abort_cb(struct bt_obex_client *obex_client, uint8_t rsp_code,
+				     struct net_buf *buf)
+{
+	struct bt_opp_client *client = CONTAINER_OF(obex_client, struct bt_opp_client, _client);
+
+	LOG_DBG("client %p ABORT rsp 0x%02x", client, rsp_code);
+
+	/*
+	 * Only a SUCCESS abort response reaches this callback. On any other
+	 * response code the OBEX layer closes the transport, as IrOBEX 1.2
+	 * section 3.3.5 asks, and opp_client_transport_disconnected() resets
+	 * the state instead.
+	 */
+	atomic_clear(&client->_push_state);
+	atomic_clear(&client->_pull_state);
+
+	client->cb->abort(client, rsp_code, buf);
+}
+
+static const struct bt_obex_client_ops opp_client_obex_ops = {
+	.connect    = opp_client_obex_connect_cb,
+	.disconnect = opp_client_obex_disconnect_cb,
+	.put        = opp_client_obex_put_cb,
+	.get        = opp_client_obex_get_cb,
+	.abort      = opp_client_obex_abort_cb,
+};
+
+int bt_opp_client_transport_connect(struct bt_conn *conn, struct bt_opp_client *client,
+				    const struct bt_opp_client_cb *cb, uint8_t channel)
+{
+	int err;
+
+	if (conn == NULL || client == NULL || cb == NULL) {
+		return -EINVAL;
+	}
+
+	/*
+	 * The transport callbacks are the only way the application learns that
+	 * the transport came up or went away, so they are required.
+	 *
+	 * Per the OPP Spec the Push Client shall support the Connect, Disconnect,
+	 * Put and Abort operations, while Get is optional. The response callback
+	 * of an optional operation is checked by the operation itself, see
+	 * bt_opp_client_pull().
+	 */
+	if (cb->transport_connected == NULL || cb->transport_disconnected == NULL ||
+	    cb->connect == NULL || cb->disconnect == NULL || cb->push == NULL ||
+	    cb->abort == NULL) {
+		LOG_WRN("Mandatory callback is missing");
+		return -EINVAL;
+	}
+
+	if (!atomic_cas(&client->_transport_state, BT_OPP_TRANSPORT_STATE_DISCONNECTED,
+			BT_OPP_TRANSPORT_STATE_CONNECTING)) {
+		return -EALREADY;
+	}
+
+	client->cb = cb;
+	atomic_set(&client->_state, BT_OPP_STATE_DISCONNECTED);
+	atomic_clear(&client->_push_state);
+	atomic_clear(&client->_pull_state);
+
+	BT_GOEP_INIT_V1(&client->_goep, &client->_transport);
+	client->_goep.transport_ops = &opp_client_goep_transport_ops;
+	client->_client.ops = &opp_client_obex_ops;
+	client->_client.obex = &client->_goep.obex;
+
+	err = bt_goep_transport_rfcomm_connect(conn, &client->_goep, channel);
+	if (err != 0) {
+		atomic_set(&client->_transport_state, BT_OPP_TRANSPORT_STATE_DISCONNECTED);
+	}
+
+	return err;
+}
+
+int bt_opp_client_transport_disconnect(struct bt_opp_client *client)
+{
+	int err;
+
+	if (client == NULL) {
+		return -EINVAL;
+	}
+
+	if (!atomic_cas(&client->_transport_state, BT_OPP_TRANSPORT_STATE_CONNECTED,
+			BT_OPP_TRANSPORT_STATE_DISCONNECTING)) {
+		return -ENOTCONN;
+	}
+
+	err = bt_goep_transport_rfcomm_disconnect(&client->_goep);
+	if (err != 0) {
+		/*
+		 * Only undo the transition made above. The transport may have
+		 * been torn down by the peer in the meantime, in which case the
+		 * disconnected callback already published the final state.
+		 */
+		(void)atomic_cas(&client->_transport_state, BT_OPP_TRANSPORT_STATE_DISCONNECTING,
+				 BT_OPP_TRANSPORT_STATE_CONNECTED);
+	}
+
+	return err;
+}
+
+struct net_buf *bt_opp_client_create_pdu(struct bt_opp_client *client, struct net_buf_pool *pool)
+{
+	if (client == NULL) {
+		return NULL;
+	}
+
+	return bt_goep_create_pdu(&client->_goep, pool != NULL ? pool : &bt_opp_pool);
+}
+
+int bt_opp_client_connect(struct bt_opp_client *client, uint16_t mopl, struct net_buf *buf)
+{
+	int err;
+
+	if (client == NULL) {
+		return -EINVAL;
+	}
+
+	if (atomic_get(&client->_transport_state) != BT_OPP_TRANSPORT_STATE_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	/*
+	 * OPP spec section 5.4 and Table 5.2: the Target header is not used, and
+	 * neither is any of the other headers the profile excludes.
+	 */
+	if (opp_has_excluded_header(buf)) {
+		return -EINVAL;
+	}
+
+	if (!atomic_cas(&client->_state, BT_OPP_STATE_DISCONNECTED, BT_OPP_STATE_CONNECTING)) {
+		return -EALREADY;
+	}
+
+	err = bt_obex_connect(&client->_client, mopl, buf);
+	if (err != 0) {
+		(void)atomic_cas(&client->_state, BT_OPP_STATE_CONNECTING,
+				 BT_OPP_STATE_DISCONNECTED);
+	}
+
+	return err;
+}
+
+int bt_opp_client_disconnect(struct bt_opp_client *client, struct net_buf *buf)
+{
+	int err;
+
+	if (client == NULL) {
+		return -EINVAL;
+	}
+
+	if (opp_has_excluded_header(buf)) {
+		return -EINVAL;
+	}
+
+	if (!atomic_cas(&client->_state, BT_OPP_STATE_CONNECTED, BT_OPP_STATE_DISCONNECTING)) {
+		return -ENOTCONN;
+	}
+
+	err = bt_obex_disconnect(&client->_client, buf);
+	if (err != 0) {
+		(void)atomic_cas(&client->_state, BT_OPP_STATE_DISCONNECTING,
+				 BT_OPP_STATE_CONNECTED);
+	}
+
+	return err;
+}
+
+int bt_opp_client_push(struct bt_opp_client *client, bool final, struct net_buf *buf)
+{
+	bool first;
+	int err;
+
+	if (client == NULL || buf == NULL || client->cb == NULL) {
+		return -EINVAL;
+	}
+
+	if (atomic_get(&client->_state) != BT_OPP_STATE_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	if (opp_has_excluded_header(buf)) {
+		return -EINVAL;
+	}
+
+	/*
+	 * Publish the state before the request is sent. The response is handled
+	 * in the RX thread, which may run before bt_obex_put() has returned to
+	 * this thread and ends the operation by clearing the bit. This also
+	 * tells the first PUT of a push from a continuation.
+	 */
+	first = !atomic_test_and_set_bit(&client->_push_state, BT_OPP_PUSH_ONGOING);
+
+	if (first && opp_push_first_req_check(buf) != 0) {
+		atomic_clear_bit(&client->_push_state, BT_OPP_PUSH_ONGOING);
+		return -EINVAL;
+	}
+
+	/*
+	 * OPP spec Table 5.2 makes the End-of-Body header mandatory, and per
+	 * IrOBEX 1.2 section 2.2.9 it is what signals the end of the object.
+	 * Without it the server cannot tell that the object is complete, and
+	 * per section 3.3.3.6 a push that carries no object body at all is a
+	 * delete request instead.
+	 */
+	if (final && !bt_obex_has_header(buf, BT_OBEX_HEADER_ID_END_BODY)) {
+		LOG_ERR("OBEX header (End of Body) is missing");
+		if (first) {
+			atomic_clear_bit(&client->_push_state, BT_OPP_PUSH_ONGOING);
+		}
+
+		return -ENODATA;
+	}
+
+	err = bt_obex_put(&client->_client, final, buf);
+	if (err != 0 && first) {
+		/*
+		 * Nothing has been sent and this call started the operation, so
+		 * the bit that published it is undone. A continuation leaves the
+		 * operation ongoing; if the transport was torn down in the
+		 * meantime, the disconnected callback already cleared it.
+		 */
+		atomic_clear_bit(&client->_push_state, BT_OPP_PUSH_ONGOING);
+	}
+
+	return err;
+}
+
+int bt_opp_client_pull(struct bt_opp_client *client, struct net_buf *buf)
+{
+	bool first;
+	int err;
+
+	if (client == NULL || buf == NULL || client->cb == NULL) {
+		return -EINVAL;
+	}
+
+	if (atomic_get(&client->_state) != BT_OPP_STATE_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	if (client->cb->pull == NULL) {
+		LOG_WRN("client %p cannot handle the pull response", client);
+		return -ENOTSUP;
+	}
+
+	if (opp_has_excluded_header(buf)) {
+		return -EINVAL;
+	}
+
+	/*
+	 * Publish the state before the request is sent, see
+	 * bt_opp_client_push(). This also tells the first GET of a pull from a
+	 * continuation.
+	 */
+	first = !atomic_test_and_set_bit(&client->_pull_state, BT_OPP_PULL_ONGOING);
+
+	/*
+	 * OPP spec section 5.6: the Push Client must use the Type header when
+	 * getting the Default Get Object. IrOBEX 1.2 section 8.4 spells out the
+	 * same procedure. Only the first request of a pull operation carries it,
+	 * a continuation request carries no headers at all.
+	 */
+	if (first && !bt_obex_has_header(buf, BT_OBEX_HEADER_ID_TYPE)) {
+		LOG_ERR("OBEX header (Type) is missing");
+		atomic_clear_bit(&client->_pull_state, BT_OPP_PULL_ONGOING);
+		return -ENODATA;
+	}
+
+	/*
+	 * The Default Get Object is the only object a Push Server serves, so a
+	 * request addressing anything else would just be refused by the peer.
+	 */
+	if (opp_pull_req_check(buf) != 0) {
+		if (first) {
+			atomic_clear_bit(&client->_pull_state, BT_OPP_PULL_ONGOING);
+		}
+
+		return -EINVAL;
+	}
+
+	/*
+	 * Every GET of a pull operation sets the Final bit: the first request
+	 * carries all the request headers, which completes the request phase,
+	 * and IrOBEX 1.2 section 3.3.4 requires the bit on every continuation
+	 * request that follows.
+	 */
+	err = bt_obex_get(&client->_client, true, buf);
+	if (err != 0 && first) {
+		atomic_clear_bit(&client->_pull_state, BT_OPP_PULL_ONGOING);
+	}
+
+	return err;
+}
+
+int bt_opp_client_abort(struct bt_opp_client *client, struct net_buf *buf)
+{
+	if (client == NULL || client->cb == NULL) {
+		return -EINVAL;
+	}
+
+	if (atomic_get(&client->_state) != BT_OPP_STATE_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	if (opp_has_excluded_header(buf)) {
+		return -EINVAL;
+	}
+
+	return bt_obex_abort(&client->_client, buf);
+}
+
+#endif /* CONFIG_BT_OPP_CLIENT */
+
+#if defined(CONFIG_BT_OPP_SERVER)
+
+/*
+ * IrOBEX 1.2 section 2.2.11: a Connection Id is only handed out in the response
+ * to a connect request that carries a Target header, which OPP does not use
+ * (OPP spec section 5.4). A Connection Id this server never assigned is
+ * therefore invalid whatever its value, and the section recommends answering
+ * such a request with "Service Unavailable". Section 3.3.2 names the same
+ * response code for a disconnect request, and section 2.2.11 forbids the header
+ * in a connect request outright.
+ *
+ * The OBEX layer routes a request other than CONNECT by its Connection Id alone
+ * and answers "Not Found" itself when no server owns that id. It only sets the
+ * _conn_id of a server that accepts a connect request with a Target header,
+ * which OPP never does, so a PUT, GET or DISCONNECT only reaches this check
+ * when its Connection Id happens to equal the initial _conn_id, 0 for a
+ * zero-initialized instance. Any other value, 0xFFFFFFFF included, is answered
+ * "Not Found" without OPP seeing it. CONNECT is not routed by Connection Id and
+ * reaches this check with any value.
+ */
+static bool opp_req_has_conn_id(struct net_buf *buf)
+{
+	if (!bt_obex_has_header(buf, BT_OBEX_HEADER_ID_CONN_ID)) {
+		return false;
+	}
+
+	LOG_WRN("Request carries a Connection Id, which OPP does not assign");
 
 	return true;
 }
 
-static void opp_shell_print_body_headers(struct net_buf *buf, const char *prefix)
-{
-	struct opp_shell_body_print_data data = {
-		.prefix = prefix,
-	};
-	int err;
-
-	if (buf == NULL) {
-		bt_shell_print("%s carries no body", prefix);
-		return;
-	}
-
-	err = bt_obex_header_parse(buf, opp_shell_print_body_header, &data);
-	if (err != 0) {
-		bt_shell_print("%s failed to parse headers (err %d)", prefix, err);
-	} else if (!data.found) {
-		bt_shell_print("%s carries no body", prefix);
-	}
-}
-
-#if defined(CONFIG_BT_OPP_CLIENT)
-
-#define OPP_SDP_CLIENT_BUF_LEN 512
-
-static struct bt_opp_client opp_client;
-static uint8_t opp_rfcomm_channel;
-
-/* Set while opp_client owns a transport, to keep the client from being reset
- * underneath a live connection.
+/*
+ * Check the Name header of a PUT request, and report whether the request names
+ * the object.
+ *
+ * Returns 0 when the header is absent or names the object, or the response code
+ * that rejects the request.
  */
-static bool opp_cli_transport_active;
-
-/* Set by 'opp exchange' before its push is sent; cleared on the push's
- * final response, abort or disconnect.
- */
-static bool opp_cli_exchange_pending;
-
-/* Small static demo payloads for push commands. */
-static const char opp_demo_vcard[] =
-	"BEGIN:VCARD\r\nVERSION:2.1\r\nFN:Zephyr Shell\r\nEND:VCARD\r\n";
-static const char opp_demo_vcal[] = "BEGIN:VCALENDAR\r\nVERSION:1.0\r\nBEGIN:VEVENT\r\n"
-				    "SUMMARY:Shell Event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-static const char opp_demo_vnote[] =
-	"BEGIN:VNOTE\r\nVERSION:1.1\r\nBODY:Hello from shell\r\nEND:VNOTE\r\n";
-static const char opp_demo_vmsg[] = "BEGIN:VMSG\r\nVERSION:1.1\r\nBEGIN:VBODY\r\n"
-				    "Body:Shell vMessage\r\nEND:VBODY\r\nEND:VMSG\r\n";
-
-static uint8_t opp_sdp_cb(struct bt_conn *conn, struct bt_sdp_client_result *result,
-			  const struct bt_sdp_discover_params *params)
+static uint8_t opp_push_name_check(struct net_buf *buf, bool *named)
 {
-	uint16_t rfcomm_ch;
-
-	if (result == NULL || result->resp_buf == NULL) {
-		/* Reached when no (further) record is resolved: the peer has no
-		 * OPP service or the discovery failed. A discovery that resolves
-		 * its records does not end with this call.
-		 */
-		if (opp_rfcomm_channel == 0) {
-			bt_shell_print("OPP SDP: no OPP service found on remote device");
-		}
-		return BT_SDP_DISCOVER_UUID_STOP;
-	}
-
-	bt_shell_print("OPP SDP: got a service record (buf len=%u)", result->resp_buf->len);
-
-	if (bt_sdp_get_proto_param(result->resp_buf, BT_SDP_PROTO_RFCOMM, &rfcomm_ch) == 0) {
-		opp_rfcomm_channel = (uint8_t)rfcomm_ch;
-		bt_shell_print("OPP SDP: RFCOMM channel = %u", opp_rfcomm_channel);
-	} else {
-		bt_shell_print("OPP SDP: no RFCOMM channel in this record");
-	}
-
-	return BT_SDP_DISCOVER_UUID_CONTINUE;
-}
-
-NET_BUF_POOL_FIXED_DEFINE(sdp_client_pool, CONFIG_BT_MAX_CONN, OPP_SDP_CLIENT_BUF_LEN, 8, NULL);
-
-static struct bt_sdp_discover_params opp_sdp_params = {
-	.type = BT_SDP_DISCOVER_SERVICE_SEARCH_ATTR,
-	.uuid = BT_OPP_SDP_UUID,
-	.func = opp_sdp_cb,
-	.pool = &sdp_client_pool,
-};
-
-static void opp_cli_transport_connected(struct bt_conn *conn, struct bt_opp_client *client)
-{
-	bt_shell_print("OPP: transport connected");
-}
-
-static void opp_cli_transport_disconnected(struct bt_opp_client *client)
-{
-	opp_cli_transport_active = false;
-	opp_cli_exchange_pending = false;
-
-	bt_shell_print("OPP: transport disconnected");
-}
-
-static void opp_cli_connect(struct bt_opp_client *client, uint8_t rsp_code, uint8_t version,
-			    uint16_t mopl, struct net_buf *buf)
-{
-	bt_shell_print("OPP: OBEX connect rsp=0x%02x version=0x%02x mopl=%u", rsp_code, version,
-		       mopl);
-}
-
-static void opp_cli_disconnect(struct bt_opp_client *client, uint8_t rsp_code, struct net_buf *buf)
-{
-	bt_shell_print("OPP: OBEX disconnect rsp=0x%02x", rsp_code);
-	opp_cli_exchange_pending = false;
-}
-
-static void opp_cli_push(struct bt_opp_client *client, uint8_t rsp_code, struct net_buf *buf)
-{
-	struct net_buf *pull_buf;
-	int err;
-
-	bt_shell_print("OPP: push rsp=0x%02x", rsp_code);
-
-	/* Only the final response to a Business Card Exchange push goes on. */
-	if (!opp_cli_exchange_pending || rsp_code == BT_OPP_RSP_CODE_CONTINUE) {
-		return;
-	}
-
-	/* The exchange push is over: consume the flag whatever the answer. */
-	opp_cli_exchange_pending = false;
-
-	if (rsp_code != BT_OPP_RSP_CODE_SUCCESS && rsp_code != BT_OPP_RSP_CODE_OK) {
-		bt_shell_print("OPP: exchange push rejected (rsp 0x%02x), skip pull", rsp_code);
-		return;
-	}
-
-	/* Auto-pull the server's business card. */
-	pull_buf = bt_opp_client_create_pdu(client, NULL);
-	if (pull_buf == NULL) {
-		bt_shell_print("OPP: exchange pull - create PDU failed");
-		return;
-	}
-
-	/* Type header: required by OPP Spec section 5.6. */
-	err = bt_obex_add_header_type(pull_buf, (uint16_t)(strlen(BT_OPP_TYPE_VCARD) + 1),
-				      (const uint8_t *)BT_OPP_TYPE_VCARD);
-	if (err != 0) {
-		bt_shell_print("OPP: exchange pull - add type header failed (err %d)", err);
-		net_buf_unref(pull_buf);
-		return;
-	}
-
-	/*
-	 * IrOBEX 1.2 section 8.4: the Default Get Object is requested
-	 * with the Type header and an empty Name header, which is
-	 * treated the same as no Name header.
-	 */
-	err = bt_obex_add_header_name(pull_buf, 0, NULL);
-	if (err != 0) {
-		bt_shell_print("OPP: exchange pull - add name header failed (err %d)", err);
-		net_buf_unref(pull_buf);
-		return;
-	}
-
-	err = bt_opp_client_pull(client, pull_buf);
-	if (err != 0) {
-		net_buf_unref(pull_buf);
-		bt_shell_print("OPP: exchange pull failed (err %d)", err);
-		return;
-	}
-
-	bt_shell_print("OPP: exchange - pulling server business card");
-}
-
-static void opp_cli_pull(struct bt_opp_client *client, uint8_t rsp_code, struct net_buf *buf)
-{
-	struct net_buf *next_buf;
-	int err;
-
-	bt_shell_print("OPP: pull rsp=0x%02x", rsp_code);
-
-	if ((rsp_code != BT_OPP_RSP_CODE_SUCCESS && rsp_code != BT_OPP_RSP_CODE_CONTINUE) ||
-	    buf == NULL) {
-		return;
-	}
-
-	opp_shell_print_body_headers(buf, "OPP: bcard");
-
-	if (rsp_code != BT_OPP_RSP_CODE_CONTINUE) {
-		return;
-	}
-
-	/*
-	 * The server has more of the business card to send, possibly after a
-	 * response that carried no body at all. Ask for the next part with a
-	 * continuation request, which carries no headers.
-	 */
-	next_buf = bt_opp_client_create_pdu(client, NULL);
-	if (next_buf == NULL) {
-		bt_shell_print("OPP: pull continue - create PDU failed");
-		return;
-	}
-
-	err = bt_opp_client_pull(client, next_buf);
-	if (err != 0) {
-		net_buf_unref(next_buf);
-		bt_shell_print("OPP: pull continue failed (err %d)", err);
-	}
-}
-
-static void opp_cli_abort(struct bt_opp_client *client, uint8_t rsp_code, struct net_buf *buf)
-{
-	bt_shell_print("OPP: abort rsp=0x%02x", rsp_code);
-
-	/* An abort cancels any in-progress exchange; clear the pending flag so
-	 * a subsequent push does not mistakenly trigger the pull phase.
-	 */
-	opp_cli_exchange_pending = false;
-}
-
-static const struct bt_opp_client_cb opp_client_cb = {
-	.transport_connected = opp_cli_transport_connected,
-	.transport_disconnected = opp_cli_transport_disconnected,
-	.connect = opp_cli_connect,
-	.disconnect = opp_cli_disconnect,
-	.push = opp_cli_push,
-	.pull = opp_cli_pull,
-	.abort = opp_cli_abort,
-};
-
-static uint16_t ascii_to_utf16be(const char *str, uint8_t *out, uint16_t out_max)
-{
+	static const char path_chars[] = ":/\\";
+	const uint8_t *name;
 	uint16_t len = 0;
 
-	if (out_max < 2U) {
+	*named = false;
+
+	if (bt_obex_get_header_name(buf, &len, &name) != 0) {
 		return 0;
 	}
 
-	/* Keep room for the 2-byte UTF-16BE null terminator written below. */
-	while (*str != '\0' && (len + 4U) <= out_max) {
-		out[len++] = 0x00;
-		out[len++] = (uint8_t)*str++;
+	/*
+	 * OPP spec Table 5.2: the Name header names the object, so it has to
+	 * hold a name. Per IrOBEX 1.2 section 2.2.2 an empty Name header carries
+	 * no value, so len is 0; a peer that sends the UTF-16BE null terminator
+	 * on its own gives len 2 instead. Both name no object.
+	 *
+	 * IrOBEX 1.2 section 10.6.2 (HC5, HS5) requires a received Unicode
+	 * header to be verified null terminated, which bt_obex_string_is_valid()
+	 * does along with the length and the surrogate pairs.
+	 */
+	if (len <= 2U || !bt_obex_string_is_valid(BT_OBEX_HEADER_ID_NAME, len, name)) {
+		LOG_WRN("PUT carries an empty or malformed OBEX header (Name)");
+		return BT_OPP_RSP_CODE_BAD_REQ;
 	}
 
-	out[len++] = 0x00;
-	out[len++] = 0x00;
+	/*
+	 * IrOBEX 1.2 section 4.3: the name of an object pushed into the inbox
+	 * should not contain a path character such as ':', '/' or '\', and an
+	 * object with an improperly formed name should be rejected. The name is
+	 * UTF-16BE (section 2.2.2), so a path character is a code unit whose
+	 * high byte is zero and whose low byte is one of the three.
+	 */
+	for (uint16_t i = 0; (i + 1U) < len; i += 2U) {
+		if (name[i] != 0U) {
+			continue;
+		}
 
-	return len;
-}
-
-/* opp discover - run SDP discovery for OPP on the current ACL connection */
-static int cmd_opp_discover(const struct shell *sh, size_t argc, char *argv[])
-{
-	int err;
-
-	if (default_conn == NULL) {
-		shell_error(sh, "Not connected");
-		return -ENOEXEC;
+		if (memchr(path_chars, name[i + 1U], sizeof(path_chars) - 1U) != NULL) {
+			LOG_WRN("PUT names a path, which the inbox does not accept");
+			return BT_OPP_RSP_CODE_BAD_REQ;
+		}
 	}
 
-	opp_rfcomm_channel = 0;
+	*named = true;
 
-	err = bt_sdp_discover(default_conn, &opp_sdp_params);
-	if (err != 0) {
-		shell_error(sh, "SDP discover failed (err %d)", err);
-		return err;
-	}
-
-	shell_print(sh, "SDP discover started");
 	return 0;
 }
 
-/* opp transport_connect - connect RFCOMM using SDP-discovered channel */
-static int cmd_opp_transport_connect(const struct shell *sh, size_t argc, char *argv[])
+/* GOEP transport ops for the server */
+static void opp_server_transport_connected(struct bt_conn *conn, struct bt_goep *goep)
+{
+	struct bt_opp_server *server = CONTAINER_OF(goep, struct bt_opp_server, _goep);
+
+	atomic_set(&server->_transport_state, BT_OPP_TRANSPORT_STATE_CONNECTED);
+
+	LOG_DBG("server %p transport connected", server);
+
+	if (server->cb->transport_connected != NULL) {
+		server->cb->transport_connected(conn, server);
+	}
+}
+
+static void opp_server_transport_disconnected(struct bt_goep *goep)
+{
+	struct bt_opp_server *server = CONTAINER_OF(goep, struct bt_opp_server, _goep);
+
+	atomic_set(&server->_transport_state, BT_OPP_TRANSPORT_STATE_DISCONNECTED);
+	atomic_set(&server->_state, BT_OPP_STATE_DISCONNECTED);
+	atomic_clear(&server->_push_state);
+	atomic_clear(&server->_pull_state);
+
+	LOG_DBG("server %p transport disconnected", server);
+
+	server->cb->transport_disconnected(server);
+}
+
+static const struct bt_goep_transport_ops opp_server_goep_transport_ops = {
+	.connected    = opp_server_transport_connected,
+	.disconnected = opp_server_transport_disconnected,
+};
+
+/* OBEX server callback implementations */
+static void opp_server_obex_connect_cb(struct bt_obex_server *obex_server, uint8_t version,
+				       uint16_t mopl, struct net_buf *buf)
+{
+	struct bt_opp_server *server = CONTAINER_OF(obex_server, struct bt_opp_server, _server);
+	int err;
+
+	LOG_DBG("server %p OBEX connect req version 0x%02x mopl %u", server, version, mopl);
+
+	/*
+	 * Publish CONNECTING before handling the request. bt_opp_server_connect()
+	 * transitions to CONNECTED or RESPONDING only from CONNECTING, which the
+	 * automatic rejection of a Connection Id request below relies on.
+	 */
+	atomic_set(&server->_state, BT_OPP_STATE_CONNECTING);
+
+	/*
+	 * IrOBEX 1.2 section 2.2.11: a Connection Id header in a connect
+	 * request does not make sense and is forbidden.
+	 */
+	if (opp_req_has_conn_id(buf)) {
+		err = bt_opp_server_connect(server, mopl, BT_OPP_RSP_CODE_FORBIDDEN, NULL);
+		if (err != 0) {
+			LOG_WRN("server %p failed to reject the connect request (err %d)", server,
+				err);
+		}
+
+		return;
+	}
+
+	/*
+	 * A connect request carrying a Target header asks for a service this
+	 * server does not provide: OPP spec section 5.4 states that the header
+	 * is not used, so the server is registered without a target UUID. Per
+	 * IrOBEX 1.2 section 4.6 the server is encouraged to accept such a
+	 * request anyway and to leave the decision to continue or abort with
+	 * the client, which section 3.3.1.6 describes as a connection to the
+	 * inbox service. The request is therefore reported to the application
+	 * like any other.
+	 *
+	 * Note that accepting it with a success response is not possible as
+	 * long as the OBEX layer requires that response to carry the Who and
+	 * Connection ID headers, both of which OPP excludes (Table 5.2), so
+	 * such a request can only be answered with an error response.
+	 */
+	if (bt_obex_has_header(buf, BT_OBEX_HEADER_ID_TARGET)) {
+		LOG_WRN("server %p connect req carries a Target header", server);
+	}
+
+	server->cb->connect(server, version, mopl, buf);
+}
+
+static void opp_server_obex_disconnect_cb(struct bt_obex_server *obex_server, struct net_buf *buf)
+{
+	struct bt_opp_server *server = CONTAINER_OF(obex_server, struct bt_opp_server, _server);
+	int err;
+
+	LOG_DBG("server %p OBEX disconnect req", server);
+
+	/*
+	 * IrOBEX 1.2 section 3.3.2: a disconnect may not be refused, but a
+	 * disconnect request that carries invalid information such as an
+	 * invalid Connection Id may be answered with "Service Unavailable".
+	 * Only a Connection Id that the OBEX layer matched to this server gets
+	 * here, see opp_req_has_conn_id().
+	 */
+	if (opp_req_has_conn_id(buf)) {
+		err = bt_opp_server_disconnect(server, BT_OPP_RSP_CODE_UNAVAIL, NULL);
+		if (err != 0) {
+			LOG_WRN("server %p failed to reject the disconnect req (err %d)", server,
+				err);
+		}
+
+		return;
+	}
+
+	server->cb->disconnect(server, buf);
+}
+
+/*
+ * Track the headers of the push operation the Push Server is receiving and
+ * check the request against the profile.
+ *
+ * Returns 0 when the request is acceptable, or the response code that rejects
+ * it.
+ */
+static uint8_t opp_push_req_check(struct bt_opp_server *server, bool final, struct net_buf *buf)
+{
+	uint8_t rsp_code;
+	bool named;
+
+	if (opp_req_has_conn_id(buf)) {
+		return BT_OPP_RSP_CODE_UNAVAIL;
+	}
+
+	rsp_code = opp_push_name_check(buf, &named);
+	if (rsp_code != 0) {
+		return rsp_code;
+	}
+
+	if (named) {
+		atomic_set_bit(&server->_push_state, BT_OPP_PUSH_NAME);
+	}
+
+	if (bt_obex_has_header(buf, BT_OBEX_HEADER_ID_BODY) ||
+	    bt_obex_has_header(buf, BT_OBEX_HEADER_ID_END_BODY)) {
+		/*
+		 * OPP spec Table 5.2: the Name header that names the object is
+		 * mandatory. Per IrOBEX 1.2 section 3.3.3.1 it only has to
+		 * precede the object body, so it may arrive in any request of
+		 * the operation up to the one that starts the body. The Length
+		 * header is not enforced: section 2.2.4 makes it optional for
+		 * the sender that does not know the size in advance, and the
+		 * End-of-Body header is what marks the end of the object.
+		 */
+		if (!atomic_test_bit(&server->_push_state, BT_OPP_PUSH_NAME)) {
+			LOG_WRN("PUT sends the object body before the OBEX header (Name)");
+			return BT_OPP_RSP_CODE_BAD_REQ;
+		}
+
+		atomic_set_bit(&server->_push_state, BT_OPP_PUSH_BODY);
+	}
+
+	/*
+	 * IrOBEX 1.2 section 3.3.3.6: a PUT operation with no Body and no
+	 * End-of-Body header whatsoever is a delete request. The Object Push
+	 * profile has no delete feature (OPP spec Table 4.1), so refuse it
+	 * instead of reporting an object the client never pushed.
+	 */
+	if (final && !atomic_test_bit(&server->_push_state, BT_OPP_PUSH_BODY)) {
+		LOG_WRN("PUT carries no object body, which OPP does not support");
+		return BT_OPP_RSP_CODE_FORBIDDEN;
+	}
+
+	return 0;
+}
+
+static void opp_server_obex_put_cb(struct bt_obex_server *obex_server, bool final,
+				   struct net_buf *buf)
+{
+	struct bt_opp_server *server = CONTAINER_OF(obex_server, struct bt_opp_server, _server);
+	bool ongoing = atomic_test_and_set_bit(&server->_push_state, BT_OPP_PUSH_ONGOING);
+	uint8_t rsp_code;
+	int err;
+
+	LOG_DBG("server %p PUT req (final=%d)", server, final);
+
+	/*
+	 * A push that carries object data before any of its requests has named
+	 * the object, or that ends without any object data, is rejected here
+	 * without invoking the application callback.
+	 */
+	rsp_code = opp_push_req_check(server, final, buf);
+	if (rsp_code != 0) {
+		err = bt_opp_server_push(server, rsp_code, NULL);
+		if (err != 0) {
+			LOG_WRN("server %p failed to reject the PUT request (err %d)", server, err);
+		}
+
+		/*
+		 * This request started the operation, so the state it tracked
+		 * is dropped with the rejected operation. bt_opp_server_push()
+		 * already cleared it when the response was sent.
+		 */
+		if (!ongoing) {
+			atomic_clear(&server->_push_state);
+		}
+
+		if (ongoing) {
+			err = bt_goep_transport_rfcomm_disconnect(&server->_goep);
+			if (err != 0) {
+				LOG_WRN("server %p failed to disconnect after rejecting "
+					"PUT (err %d)",
+					server, err);
+			}
+		}
+
+		return;
+	}
+
+	server->cb->push(server, final, buf);
+}
+
+static void opp_server_obex_get_cb(struct bt_obex_server *obex_server, bool final,
+				   struct net_buf *buf)
+{
+	struct bt_opp_server *server = CONTAINER_OF(obex_server, struct bt_opp_server, _server);
+	bool ongoing = atomic_test_and_set_bit(&server->_pull_state, BT_OPP_PULL_ONGOING);
+	uint8_t rsp_code;
+	int err;
+
+	LOG_DBG("server %p GET req (final=%d)", server, final);
+
+	/*
+	 * The Default Get Object is the only object the Push Server serves, so a
+	 * request addressing anything else is rejected here without invoking the
+	 * application callback.
+	 */
+	if (opp_req_has_conn_id(buf)) {
+		rsp_code = BT_OPP_RSP_CODE_UNAVAIL;
+	} else {
+		rsp_code = opp_pull_req_check(buf);
+	}
+
+	if (rsp_code != 0) {
+		err = bt_opp_server_pull(server, rsp_code, NULL);
+		if (err != 0) {
+			LOG_WRN("server %p failed to reject the GET request (err %d)", server, err);
+		}
+
+		/*
+		 * This request started the operation, so the state it tracked
+		 * is dropped with the rejected operation. bt_opp_server_pull()
+		 * already cleared it when the response was sent.
+		 */
+		if (!ongoing) {
+			atomic_clear(&server->_pull_state);
+		}
+
+		if (ongoing) {
+			err = bt_goep_transport_rfcomm_disconnect(&server->_goep);
+			if (err != 0) {
+				LOG_WRN("server %p failed to disconnect after rejecting "
+					"GET (err %d)",
+					server, err);
+			}
+		}
+
+		return;
+	}
+
+	server->cb->pull(server, final, buf);
+}
+
+static void opp_server_obex_abort_cb(struct bt_obex_server *obex_server, struct net_buf *buf)
+{
+	struct bt_opp_server *server = CONTAINER_OF(obex_server, struct bt_opp_server, _server);
+
+	LOG_DBG("server %p ABORT req", server);
+
+	/* The aborted operation is over, whatever the application answers. */
+	atomic_clear(&server->_push_state);
+	atomic_clear(&server->_pull_state);
+
+	server->cb->abort(server, buf);
+}
+
+static const struct bt_obex_server_ops opp_server_obex_ops = {
+	.connect    = opp_server_obex_connect_cb,
+	.disconnect = opp_server_obex_disconnect_cb,
+	.put        = opp_server_obex_put_cb,
+	.get        = opp_server_obex_get_cb,
+	.abort      = opp_server_obex_abort_cb,
+};
+
+static int opp_transport_goep_accept(struct bt_conn *conn,
+				     struct bt_goep_transport_rfcomm_server *rfcomm_srv,
+				     struct bt_goep **goep)
+{
+	struct bt_opp_server_transport *opp_transport =
+		CONTAINER_OF(rfcomm_srv, struct bt_opp_server_transport, server);
+	struct bt_opp_server *opp_server = NULL;
+	int err;
+
+	err = opp_transport->accept(conn, opp_transport, &opp_server);
+	if (err != 0) {
+		return err;
+	}
+
+	if (opp_server == NULL) {
+		return -ENOMEM;
+	}
+
+	/*
+	 * The accept callback is required to call bt_opp_server_register() on
+	 * the instance it hands back, which is what installs the callbacks the
+	 * request handling relies on. Rejecting the transport request here
+	 * instead would leave the instance the application just allocated
+	 * unused and most likely leaked, so treat a missing registration as the
+	 * coding error it is.
+	 */
+	__ASSERT(opp_server->cb != NULL, "OPP server %p is not registered", opp_server);
+
+	/* Initialize GOEP v1 transport for this connection. */
+	BT_GOEP_INIT_V1(&opp_server->_goep, &opp_server->_transport);
+	opp_server->_goep.transport_ops = &opp_server_goep_transport_ops;
+	atomic_set(&opp_server->_transport_state, BT_OPP_TRANSPORT_STATE_CONNECTING);
+
+	*goep = &opp_server->_goep;
+
+	return 0;
+}
+
+int bt_opp_server_transport_register(struct bt_opp_server_transport *server)
+{
+	if (server == NULL || server->accept == NULL) {
+		return -EINVAL;
+	}
+
+	server->server.accept = opp_transport_goep_accept;
+
+	return bt_goep_transport_rfcomm_server_register(&server->server);
+}
+
+int bt_opp_server_register(struct bt_opp_server *server, const struct bt_opp_server_cb *cb)
 {
 	int err;
 
-	if (default_conn == NULL) {
-		shell_error(sh, "Not connected");
-		return -ENOEXEC;
+	if (server == NULL || cb == NULL) {
+		return -EINVAL;
 	}
 
-	if (opp_rfcomm_channel == 0) {
-		shell_error(sh, "No RFCOMM channel - run 'opp discover' first");
-		return -ENOENT;
-	}
-
-	/* Resetting the instance while a transport is up would defeat the
-	 * -EALREADY check inside bt_opp_client_transport_connect().
+	/*
+	 * transport_disconnected() is the only signal the application gets that
+	 * the instance is free again, so it is required. transport_connected()
+	 * is not: accept() already told the application about the connection.
 	 */
-	if (opp_cli_transport_active) {
-		shell_error(sh, "OPP client transport already in use");
+	if (cb->transport_disconnected == NULL || cb->connect == NULL ||
+	    cb->disconnect == NULL || cb->push == NULL || cb->pull == NULL ||
+	    cb->abort == NULL) {
+		LOG_WRN("Mandatory callback is missing");
+		return -EINVAL;
+	}
+
+	if (atomic_get(&server->_state) != BT_OPP_STATE_DISCONNECTED) {
+		LOG_WRN("server %p is in use", server);
+		return -EINPROGRESS;
+	}
+
+	if (server->cb != NULL) {
+		LOG_WRN("server %p is already registered", server);
 		return -EALREADY;
 	}
 
-	memset(&opp_client, 0, sizeof(opp_client));
-	opp_cli_transport_active = true;
+	server->cb = cb;
+	atomic_clear(&server->_push_state);
+	atomic_clear(&server->_pull_state);
+	server->_server.obex = &server->_goep.obex;
+	server->_server.ops = &opp_server_obex_ops;
 
-	err = bt_opp_client_transport_connect(default_conn, &opp_client, &opp_client_cb,
-					      opp_rfcomm_channel);
+	/* OPP does not use a Target UUID (spec section 5.4). */
+	err = bt_obex_server_register(&server->_server, NULL);
 	if (err != 0) {
-		opp_cli_transport_active = false;
-		shell_error(sh, "transport connect failed (err %d)", err);
-		return err;
+		server->cb = NULL;
 	}
 
-	shell_print(sh, "OPP transport connecting channel=%u", opp_rfcomm_channel);
-	return 0;
-}
-
-/* opp transport_disconnect */
-static int cmd_opp_transport_disconnect(const struct shell *sh, size_t argc, char *argv[])
-{
-	int err = bt_opp_client_transport_disconnect(&opp_client);
-
-	if (err != 0) {
-		shell_error(sh, "transport disconnect failed (err %d)", err);
-		return err;
-	}
-
-	shell_print(sh, "OPP transport disconnecting");
-	return 0;
-}
-
-/* opp connect [mopl] */
-static int cmd_opp_connect(const struct shell *sh, size_t argc, char *argv[])
-{
-	uint16_t mopl = 0xffffU;
-	int err;
-
-	if (argc >= 2) {
-		mopl = (uint16_t)strtoul(argv[1], NULL, 0);
-	}
-
-	err = bt_opp_client_connect(&opp_client, mopl, NULL);
-	if (err != 0) {
-		shell_error(sh, "OBEX connect failed (err %d)", err);
-		return err;
-	}
-
-	shell_print(sh, "OPP OBEX connecting mopl=%u", mopl);
-	return 0;
-}
-
-/* opp disconnect */
-static int cmd_opp_disconnect(const struct shell *sh, size_t argc, char *argv[])
-{
-	int err = bt_opp_client_disconnect(&opp_client, NULL);
-
-	if (err != 0) {
-		shell_error(sh, "OBEX disconnect failed (err %d)", err);
-		return err;
-	}
-
-	shell_print(sh, "OPP OBEX disconnecting");
-	return 0;
-}
-
-/* opp push <vcard|vcal|vnote|vmsg> - push a demo object of the specified type */
-static int cmd_opp_push(const struct shell *sh, size_t argc, char *argv[])
-{
-	struct net_buf *buf;
-	uint8_t name_utf16[32];
-	uint16_t name_len;
-	const char *type_str;
-	const char *name_str;
-	const char *data;
-	size_t data_len;
-	int err;
-
-	if (argc < 2) {
-		shell_error(sh, "Usage: push <vcard|vcal|vnote|vmsg>");
-		return -EINVAL;
-	}
-
-	if (strcmp(argv[1], "vcard") == 0) {
-		type_str = BT_OPP_TYPE_VCARD;
-		name_str = "contact.vcf";
-		data = opp_demo_vcard;
-	} else if (strcmp(argv[1], "vcal") == 0) {
-		type_str = BT_OPP_TYPE_VCAL;
-		name_str = "event.vcs";
-		data = opp_demo_vcal;
-	} else if (strcmp(argv[1], "vnote") == 0) {
-		type_str = BT_OPP_TYPE_VNOTE;
-		name_str = "note.vnt";
-		data = opp_demo_vnote;
-	} else if (strcmp(argv[1], "vmsg") == 0) {
-		type_str = BT_OPP_TYPE_VMESSAGE;
-		name_str = "msg.vmg";
-		data = opp_demo_vmsg;
-	} else {
-		shell_error(sh, "Unknown type '%s'. Use: vcard | vcal | vnote | vmsg", argv[1]);
-		return -EINVAL;
-	}
-
-	data_len = strlen(data);
-
-	buf = bt_opp_client_create_pdu(&opp_client, NULL);
-	if (buf == NULL) {
-		shell_error(sh, "create PDU failed");
-		return -ENOMEM;
-	}
-
-	name_len = ascii_to_utf16be(name_str, name_utf16, sizeof(name_utf16));
-
-	err = bt_obex_add_header_name(buf, name_len, name_utf16);
-	if (err != 0) {
-		shell_error(sh, "Fail to add name header %d", err);
-		goto failed;
-	}
-
-	err = bt_obex_add_header_type(buf, (uint16_t)(strlen(type_str) + 1),
-				      (const uint8_t *)type_str);
-	if (err != 0) {
-		shell_error(sh, "Fail to add type header %d", err);
-		goto failed;
-	}
-
-	err = bt_obex_add_header_len(buf, (uint32_t)data_len);
-	if (err != 0) {
-		shell_error(sh, "Fail to add length header %d", err);
-		goto failed;
-	}
-
-	err = bt_obex_add_header_end_body(buf, (uint16_t)data_len, (const uint8_t *)data);
-	if (err != 0) {
-		shell_error(sh, "Fail to add end-of-body header %d", err);
-		goto failed;
-	}
-
-	/* Single-packet push: End-of-Body is already in buf, so final=true. */
-	err = bt_opp_client_push(&opp_client, true, buf);
-	if (err != 0) {
-		shell_error(sh, "push failed (err %d)", err);
-		goto failed;
-	}
-
-	shell_print(sh, "OPP pushing %s (%s)", argv[1], name_str);
-	return 0;
-
-failed:
-	net_buf_unref(buf);
 	return err;
 }
 
-/* opp pull - pull server's default business card */
-static int cmd_opp_pull(const struct shell *sh, size_t argc, char *argv[])
+int bt_opp_server_unregister(struct bt_opp_server *server)
 {
-	struct net_buf *buf;
 	int err;
 
-	buf = bt_opp_client_create_pdu(&opp_client, NULL);
-	if (buf == NULL) {
-		shell_error(sh, "create PDU failed");
-		return -ENOMEM;
+	if (server == NULL) {
+		return -EINVAL;
 	}
 
-	err = bt_obex_add_header_type(buf, (uint16_t)(strlen(BT_OPP_TYPE_VCARD) + 1),
-				      (const uint8_t *)BT_OPP_TYPE_VCARD);
+	if (server->cb == NULL) {
+		return -EALREADY;
+	}
+
+	if (atomic_get(&server->_state) != BT_OPP_STATE_DISCONNECTED) {
+		LOG_WRN("server %p is in use", server);
+		return -EINPROGRESS;
+	}
+
+	err = bt_obex_server_unregister(&server->_server);
 	if (err != 0) {
-		shell_error(sh, "Fail to add type header %d", err);
-		goto failed;
+		return err;
+	}
+
+	server->cb = NULL;
+
+	return 0;
+}
+
+struct net_buf *bt_opp_server_create_pdu(struct bt_opp_server *server, struct net_buf_pool *pool)
+{
+	if (server == NULL) {
+		return NULL;
+	}
+
+	return bt_goep_create_pdu(&server->_goep, pool != NULL ? pool : &bt_opp_pool);
+}
+
+int bt_opp_server_connect(struct bt_opp_server *server, uint16_t mopl, uint8_t rsp_code,
+			      struct net_buf *buf)
+{
+	atomic_val_t next_state;
+	int err;
+
+	if (server == NULL) {
+		return -EINVAL;
+	}
+
+	if (opp_has_excluded_header(buf)) {
+		return -EINVAL;
 	}
 
 	/*
-	 * IrOBEX 1.2 section 8.4: the Default Get Object is requested with the
-	 * Type header and an empty Name header, which is treated the same as no
-	 * Name header.
+	 * Publish the state before sending the response. A rejected CONNECT
+	 * remains busy until the response is sent, so the instance cannot be
+	 * unregistered while the OBEX layer is still using it.
 	 */
-	err = bt_obex_add_header_name(buf, 0, NULL);
+	next_state = (rsp_code == BT_OPP_RSP_CODE_SUCCESS) ? BT_OPP_STATE_CONNECTED :
+							       BT_OPP_STATE_RESPONDING;
+	if (!atomic_cas(&server->_state, BT_OPP_STATE_CONNECTING, next_state)) {
+		return -ENOTCONN;
+	}
+
+	err = bt_obex_connect_rsp(&server->_server, rsp_code, mopl, buf);
 	if (err != 0) {
-		shell_error(sh, "Fail to add name header %d", err);
-		goto failed;
+		(void)atomic_cas(&server->_state, next_state, BT_OPP_STATE_CONNECTING);
+		return err;
 	}
 
-	err = bt_opp_client_pull(&opp_client, buf);
-	if (err != 0) {
-		shell_error(sh, "pull failed (err %d)", err);
-		goto failed;
-	}
-
-	shell_print(sh, "OPP pulling business card");
-	return 0;
-
-failed:
-	net_buf_unref(buf);
-	return err;
-}
-
-/* opp exchange - Business Card Exchange: push own vCard then pull server's */
-static int cmd_opp_exchange(const struct shell *sh, size_t argc, char *argv[])
-{
-	/* Push phase (pull phase triggered from push callback in application). */
-	struct net_buf *buf;
-	uint8_t name_utf16[32];
-	uint16_t name_len;
-	size_t data_len = strlen(opp_demo_vcard);
-	int err;
-
-	if (opp_cli_exchange_pending) {
-		shell_error(sh, "exchange already in progress");
-		return -EBUSY;
-	}
-
-	buf = bt_opp_client_create_pdu(&opp_client, NULL);
-	if (buf == NULL) {
-		shell_error(sh, "create PDU failed");
-		return -ENOMEM;
-	}
-
-	name_len = ascii_to_utf16be("my_card.vcf", name_utf16, sizeof(name_utf16));
-
-	err = bt_obex_add_header_name(buf, name_len, name_utf16);
-	if (err != 0) {
-		shell_error(sh, "Fail to add name header %d", err);
-		goto failed;
-	}
-
-	err = bt_obex_add_header_type(buf, (uint16_t)(strlen(BT_OPP_TYPE_VCARD) + 1),
-				      (const uint8_t *)BT_OPP_TYPE_VCARD);
-	if (err != 0) {
-		shell_error(sh, "Fail to add type header %d", err);
-		goto failed;
-	}
-
-	err = bt_obex_add_header_len(buf, (uint32_t)data_len);
-	if (err != 0) {
-		shell_error(sh, "Fail to add length header %d", err);
-		goto failed;
-	}
-
-	err = bt_obex_add_header_end_body(buf, (uint16_t)data_len, (const uint8_t *)opp_demo_vcard);
-	if (err != 0) {
-		shell_error(sh, "Fail to add end-of-body header %d", err);
-		goto failed;
-	}
-
-	/* Set before sending: the response is handled in the RX thread and may
-	 * arrive before bt_opp_client_push() returns.
+	/*
+	 * BT_OPP_RSP_CODE_OK and BT_OPP_RSP_CODE_SUCCESS share the same
+	 * numeric value; a single check is sufficient.
 	 */
-	opp_cli_exchange_pending = true;
-
-	/* Single-packet push: End-of-Body is already in buf, so final=true. */
-	err = bt_opp_client_push(&opp_client, true, buf);
-	if (err != 0) {
-		opp_cli_exchange_pending = false;
-		shell_error(sh, "exchange push failed (err %d)", err);
-		goto failed;
+	if (rsp_code != BT_OPP_RSP_CODE_SUCCESS) {
+		(void)atomic_cas(&server->_state, BT_OPP_STATE_RESPONDING,
+				 BT_OPP_STATE_DISCONNECTED);
 	}
-
-	shell_print(sh, "OPP Business Card Exchange: push started (pull will auto-trigger)");
-	return 0;
-
-failed:
-	net_buf_unref(buf);
-	return err;
-}
-
-/* opp abort - abort current operation */
-static int cmd_opp_abort(const struct shell *sh, size_t argc, char *argv[])
-{
-	int err = bt_opp_client_abort(&opp_client, NULL);
-
-	if (err != 0) {
-		shell_error(sh, "abort failed (err %d)", err);
-		return err;
-	}
-
-	shell_print(sh, "OPP abort sent");
-	return 0;
-}
-
-#endif /* CONFIG_BT_OPP_CLIENT */
-
-#if defined(CONFIG_BT_OPP_SERVER)
-
-/* The RFCOMM channel is left at 0 so that bt_opp_server_transport_register()
- * allocates a free one. The SDP record below points at this field and is
- * registered after the transport, so it advertises the allocated channel.
- */
-static struct bt_opp_server_transport g_shell_transport_server;
-
-static struct bt_sdp_attribute opp_shell_attrs[] = {
-	BT_SDP_NEW_SERVICE,
-	/* Service Class: OBEXObjectPush (0x1105) */
-	BT_SDP_LIST(
-		BT_SDP_ATTR_SVCLASS_ID_LIST,
-		BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 3),
-		BT_SDP_DATA_ELEM_LIST(
-		{
-			BT_SDP_TYPE_SIZE(BT_SDP_UUID16),
-			BT_SDP_ARRAY_16(BT_SDP_OBEX_OBJPUSH_SVCLASS)
-		},
-		)
-	),
-	/* Protocol Descriptor List: L2CAP + RFCOMM(channel) + OBEX */
-	BT_SDP_LIST(
-		BT_SDP_ATTR_PROTO_DESC_LIST,
-		BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 17),
-		BT_SDP_DATA_ELEM_LIST(
-		{
-			BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 3),
-			BT_SDP_DATA_ELEM_LIST(
-			{
-				BT_SDP_TYPE_SIZE(BT_SDP_UUID16),
-				BT_SDP_ARRAY_16(BT_SDP_PROTO_L2CAP)
-			},
-			)
-		},
-		{
-			BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 5),
-			BT_SDP_DATA_ELEM_LIST(
-			{
-				BT_SDP_TYPE_SIZE(BT_SDP_UUID16),
-				BT_SDP_ARRAY_16(BT_SDP_PROTO_RFCOMM)
-			},
-			{
-				BT_SDP_TYPE_SIZE(BT_SDP_UINT8),
-				&g_shell_transport_server.server.rfcomm.channel
-			},
-			)
-		},
-		{
-			BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 3),
-			BT_SDP_DATA_ELEM_LIST(
-			{
-				BT_SDP_TYPE_SIZE(BT_SDP_UUID16),
-				BT_SDP_ARRAY_16(BT_SDP_PROTO_OBEX)
-			},
-			)
-		},
-		)
-	),
-	/* Profile Descriptor: OBEXObjectPush v1.1 */
-	BT_SDP_LIST(
-		BT_SDP_ATTR_PROFILE_DESC_LIST,
-		BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 8),
-		BT_SDP_DATA_ELEM_LIST(
-		{
-			BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 6),
-			BT_SDP_DATA_ELEM_LIST(
-			{
-				BT_SDP_TYPE_SIZE(BT_SDP_UUID16),
-				BT_SDP_ARRAY_16(BT_SDP_OBEX_OBJPUSH_SVCLASS)
-			},
-			{
-				BT_SDP_TYPE_SIZE(BT_SDP_UINT16),
-				/* OPP v1.1 Table 6.1 lists 0x0100 for v1.1, not 0x0101 */
-				BT_SDP_ARRAY_16(0x0100)
-			},
-			)
-		},
-		)
-	),
-	/* Service Name: optional, default value "OBEX Object Push" per OPP Spec Table 6.1. */
-	BT_SDP_SERVICE_NAME("OBEX Object Push"),
-	/* Supported Formats List: advertise the concrete formats this demo server handles. */
-	BT_SDP_LIST(
-		BT_OPP_SDP_ATTR_SUPPORTED_FORMATS,
-		BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 12),
-		BT_SDP_DATA_ELEM_LIST(
-		{
-			BT_SDP_TYPE_SIZE(BT_SDP_UINT8),
-			BT_SDP_ARRAY_8(BT_OPP_FORMAT_VCARD_2_1)
-		},
-		{
-			BT_SDP_TYPE_SIZE(BT_SDP_UINT8),
-			BT_SDP_ARRAY_8(BT_OPP_FORMAT_VCARD_3_0)
-		},
-		{
-			BT_SDP_TYPE_SIZE(BT_SDP_UINT8),
-			BT_SDP_ARRAY_8(BT_OPP_FORMAT_VCAL_1_0)
-		},
-		{
-			BT_SDP_TYPE_SIZE(BT_SDP_UINT8),
-			BT_SDP_ARRAY_8(BT_OPP_FORMAT_ICAL_2_0)
-		},
-		{
-			BT_SDP_TYPE_SIZE(BT_SDP_UINT8),
-			BT_SDP_ARRAY_8(BT_OPP_FORMAT_VNOTE)
-		},
-		{
-			BT_SDP_TYPE_SIZE(BT_SDP_UINT8),
-			BT_SDP_ARRAY_8(BT_OPP_FORMAT_VMESSAGE)
-		},
-		)
-	),
-};
-
-static struct bt_sdp_record opp_shell_sdp_rec = BT_SDP_RECORD(opp_shell_attrs);
-
-/* Single server instance - the shell supports one concurrent OPP server connection. */
-struct opp_shell_server_inst {
-	struct bt_opp_server server;
-	bool in_use;
-	bool push_final;
-	bool pull_final;
-};
-
-static struct opp_shell_server_inst g_shell_server_inst;
-
-static void opp_srv_sh_transport_connected(struct bt_conn *conn, struct bt_opp_server *server)
-{
-	bt_shell_print("OPP Server: transport connected");
-}
-
-static void opp_srv_sh_transport_disconnected(struct bt_opp_server *server)
-{
-	int err;
-
-	bt_shell_print("OPP Server: transport disconnected");
-
-	/* Release the single instance slot for reuse on the next connection. */
-	if (&g_shell_server_inst.server == server) {
-		g_shell_server_inst.pull_final = false;
-		err = bt_opp_server_unregister(server);
-		if (err != 0) {
-			bt_shell_error("OPP Server: unregister failed (err %d)", err);
-		}
-
-		g_shell_server_inst.in_use = false;
-	}
-}
-
-static void opp_srv_sh_connect(struct bt_opp_server *server, uint8_t version, uint16_t mopl,
-			       struct net_buf *buf)
-{
-	bt_shell_print("OPP Server: OBEX connect req version=0x%02x mopl=%u", version, mopl);
-	bt_shell_print("OPP Server: run 'opp server_connect_rsp success' to accept, or 'reject' to "
-		       "refuse");
-	/* Do NOT auto-reply here; the user drives the response via shell commands. */
-}
-
-static void opp_srv_sh_disconnect(struct bt_opp_server *server, struct net_buf *buf)
-{
-	bt_shell_print("OPP Server: OBEX disconnect req");
-	bt_shell_print("OPP Server: run 'opp server_disconnect_rsp' to respond");
-	/* Do NOT auto-reply; user drives the response via shell commands. */
-}
-
-static void opp_srv_sh_push(struct bt_opp_server *server, bool final, struct net_buf *buf)
-{
-	const uint8_t *name;
-	uint16_t name_len;
-	const uint8_t *type;
-	uint16_t type_len;
-
-	g_shell_server_inst.push_final = final;
-	bt_shell_print("OPP Server: push req, final %s, data len %u", final ? "true" : "false",
-		       buf->len);
-
-	if (bt_obex_get_header_name(buf, &name_len, &name) == 0 && name_len > 0) {
-		/* Name is UTF-16BE; print byte count only (conversion out of scope). */
-		bt_shell_print("OPP Server: push name (UTF-16BE, %u bytes)", name_len);
-	}
-
-	if (bt_obex_get_header_type(buf, &type_len, &type) == 0 && type != NULL && type_len > 0) {
-		bt_shell_print("OPP Server: push type: %.*s", (int)(type_len - 1), type);
-	}
-
-	opp_shell_print_body_headers(buf, "OPP Server: push");
-
-	/* Do NOT auto-reply; let the user drive the response via shell command. */
-	if (final) {
-		bt_shell_print("OPP Server: push complete, run 'opp server_push_rsp "
-			       "[success|reject|toobig|unsupported]' to respond");
-	} else {
-		bt_shell_print("OPP Server: run 'opp server_push_rsp "
-			       "[continue|reject|toobig|unsupported]' to respond");
-	}
-}
-
-static void opp_srv_sh_pull(struct bt_opp_server *server, bool final, struct net_buf *buf)
-{
-	g_shell_server_inst.pull_final = final;
-	bt_shell_print("OPP Server: business card pull request (final %d)", final);
-	if (final) {
-		bt_shell_print("OPP Server: run 'opp server_pull_rsp "
-			       "[continue|success|reject|notfound]' to respond");
-	} else {
-		bt_shell_print("OPP Server: request is incomplete; run "
-			       "'opp server_pull_rsp continue'");
-	}
-	/* Do NOT auto-reply; user drives the response via shell commands. */
-}
-
-static void opp_srv_sh_abort(struct bt_opp_server *server, struct net_buf *buf)
-{
-	bt_shell_print("OPP Server: ABORT");
-	bt_shell_print("OPP Server: run 'opp server_abort_rsp' to respond");
-	/* Do NOT auto-reply; user drives the response via shell command. */
-}
-
-static const struct bt_opp_server_cb opp_server_cb = {
-	.transport_connected = opp_srv_sh_transport_connected,
-	.transport_disconnected = opp_srv_sh_transport_disconnected,
-	.connect = opp_srv_sh_connect,
-	.disconnect = opp_srv_sh_disconnect,
-	.push = opp_srv_sh_push,
-	.pull = opp_srv_sh_pull,
-	.abort = opp_srv_sh_abort,
-};
-
-static int opp_shell_transport_accept(struct bt_conn *conn,
-				      struct bt_opp_server_transport *transport_server,
-				      struct bt_opp_server **opp_server)
-{
-	int err;
-
-	if (g_shell_server_inst.in_use) {
-		return -ENOMEM;
-	}
-
-	memset(&g_shell_server_inst, 0, sizeof(g_shell_server_inst));
-
-	err = bt_opp_server_register(&g_shell_server_inst.server, &opp_server_cb);
-	if (err != 0) {
-		return err;
-	}
-
-	/* Claim the slot only once the instance is registered. Rejecting the
-	 * connection here means the transport is never established, so
-	 * opp_srv_sh_transport_disconnected(), which is what releases the slot
-	 * again, is never called.
-	 */
-	g_shell_server_inst.in_use = true;
-	*opp_server = &g_shell_server_inst.server;
 
 	return 0;
 }
 
-static bool g_server_registered;
-
-/* opp server_register - register OPP RFCOMM server (OPP 1.1) */
-static int cmd_opp_server_register(const struct shell *sh, size_t argc, char *argv[])
+int bt_opp_server_disconnect(struct bt_opp_server *server, uint8_t rsp_code,
+				 struct net_buf *buf)
 {
+	atomic_val_t prev_push_state = 0;
+	atomic_val_t prev_pull_state = 0;
+	bool disconnecting = false;
 	int err;
 
-	if (g_server_registered) {
-		shell_warn(sh, "OPP server already registered");
-		return 0;
-	}
-
-	/* The channel is only set once the transport is registered. */
-	if (g_shell_transport_server.server.rfcomm.channel == 0U) {
-		g_shell_transport_server.accept = opp_shell_transport_accept;
-		err = bt_opp_server_transport_register(&g_shell_transport_server);
-		if (err != 0) {
-			g_shell_transport_server.server.rfcomm.channel = 0U;
-			shell_error(sh, "transport register failed (err %d)", err);
-			return err;
-		}
-	}
-
-	err = bt_sdp_register_service(&opp_shell_sdp_rec);
-	if (err != 0 && err != -EEXIST) {
-		shell_error(sh, "SDP register failed (err %d)", err);
-		return err;
-	}
-
-	g_server_registered = true;
-	shell_print(sh, "OPP server registered: RFCOMM channel=%u",
-		    g_shell_transport_server.server.rfcomm.channel);
-	return 0;
-}
-
-/* opp server_disconnect_rsp - respond to OBEX DISCONNECT request */
-static int cmd_opp_server_disconnect_rsp(const struct shell *sh, size_t argc, char *argv[])
-{
-	int err;
-
-	if (!g_shell_server_inst.in_use) {
-		shell_error(sh, "No active server connection");
-		return -ENODEV;
-	}
-
-	err = bt_opp_server_disconnect(&g_shell_server_inst.server, BT_OPP_RSP_CODE_SUCCESS,
-					   NULL);
-	if (err != 0) {
-		shell_error(sh, "disconnect rsp failed (err %d)", err);
-		return err;
-	}
-
-	shell_print(sh, "OPP server disconnect rsp sent");
-	return 0;
-}
-
-/* opp server_connect_rsp [success|reject] [mopl] - respond to incoming connect */
-static int cmd_opp_server_connect_rsp(const struct shell *sh, size_t argc, char *argv[])
-{
-	uint8_t rsp = BT_OPP_RSP_CODE_SUCCESS;
-	uint16_t mopl = 0xffffU;
-	int err;
-
-	if (!g_shell_server_inst.in_use) {
-		shell_error(sh, "No active server connection");
-		return -ENODEV;
-	}
-
-	if (argc >= 2) {
-		if (strcmp(argv[1], "success") == 0) {
-			rsp = BT_OPP_RSP_CODE_SUCCESS;
-		} else if (strcmp(argv[1], "reject") == 0) {
-			rsp = BT_OPP_RSP_CODE_FORBIDDEN;
-		} else {
-			shell_error(sh, "Unknown response '%s'. Use: success | reject", argv[1]);
-			return -EINVAL;
-		}
-	}
-
-	if (argc >= 3) {
-		mopl = (uint16_t)strtoul(argv[2], NULL, 0);
-	}
-
-	err = bt_opp_server_connect(&g_shell_server_inst.server, mopl, rsp, NULL);
-	if (err != 0) {
-		shell_error(sh, "connect rsp failed (err %d)", err);
-		return err;
-	}
-
-	shell_print(sh, "OPP server connect rsp sent (0x%02x)", rsp);
-	return 0;
-}
-
-/* opp server_push_rsp [continue|success|reject|toobig|unsupported] - respond to push.
- * Default: success for a final PUT, continue otherwise.
- */
-static int cmd_opp_server_push_rsp(const struct shell *sh, size_t argc, char *argv[])
-{
-	uint8_t rsp;
-	int err;
-
-	if (!g_shell_server_inst.in_use) {
-		shell_error(sh, "No active server connection");
-		return -ENODEV;
-	}
-
-	rsp = g_shell_server_inst.push_final ? BT_OPP_RSP_CODE_SUCCESS : BT_OPP_RSP_CODE_CONTINUE;
-
-	if (argc >= 2) {
-		if (strcmp(argv[1], "success") == 0) {
-			rsp = BT_OPP_RSP_CODE_SUCCESS;
-		} else if (strcmp(argv[1], "continue") == 0) {
-			rsp = BT_OPP_RSP_CODE_CONTINUE;
-		} else if (strcmp(argv[1], "reject") == 0) {
-			rsp = BT_OPP_RSP_CODE_FORBIDDEN;
-		} else if (strcmp(argv[1], "toobig") == 0) {
-			rsp = BT_OPP_RSP_CODE_ENTITY_TOO_LARGE;
-		} else if (strcmp(argv[1], "unsupported") == 0) {
-			rsp = BT_OPP_RSP_CODE_UNSUPP_MEDIA_TYPE;
-		} else {
-			shell_error(sh, "Unknown response '%s'. Use: "
-				    "success | continue | reject | toobig | unsupported", argv[1]);
-			return -EINVAL;
-		}
-	}
-
-	err = bt_opp_server_push(&g_shell_server_inst.server, rsp, NULL);
-	if (err != 0) {
-		shell_error(sh, "push rsp failed (err %d)", err);
-		return err;
-	}
-
-	shell_print(sh, "OPP server push rsp sent (0x%02x)", rsp);
-	return 0;
-}
-
-/* opp server_pull_rsp [continue|success|reject|notfound] - respond to business card pull */
-static int cmd_opp_server_pull_rsp(const struct shell *sh, size_t argc, char *argv[])
-{
-	static const char shell_vcard[] =
-		"BEGIN:VCARD\r\nVERSION:2.1\r\nFN:Zephyr Shell Server\r\nEND:VCARD\r\n";
-	uint8_t rsp_code = g_shell_server_inst.pull_final ? BT_OPP_RSP_CODE_SUCCESS :
-							     BT_OPP_RSP_CODE_CONTINUE;
-	int err;
-
-	if (!g_shell_server_inst.in_use) {
-		shell_error(sh, "No active server connection");
-		return -ENODEV;
-	}
-
-	if (argc >= 2) {
-		if (strcmp(argv[1], "continue") == 0) {
-			rsp_code = BT_OPP_RSP_CODE_CONTINUE;
-		} else if (strcmp(argv[1], "success") == 0) {
-			rsp_code = BT_OPP_RSP_CODE_SUCCESS;
-		} else if (strcmp(argv[1], "reject") == 0) {
-			rsp_code = BT_OPP_RSP_CODE_FORBIDDEN;
-		} else if (strcmp(argv[1], "notfound") == 0) {
-			rsp_code = BT_OPP_RSP_CODE_NOT_FOUND;
-		} else {
-			shell_error(sh, "Unknown response '%s'. Use: "
-				    "continue | success | reject | notfound",
-				    argv[1]);
-			return -EINVAL;
-		}
-	}
-
-	if (!g_shell_server_inst.pull_final && rsp_code == BT_OPP_RSP_CODE_SUCCESS) {
-		shell_error(sh, "Incomplete GET request cannot be answered with success");
+	if (server == NULL) {
 		return -EINVAL;
 	}
 
-	if (rsp_code == BT_OPP_RSP_CODE_SUCCESS) {
-		/* Send the built-in shell vCard as the default business card. */
-		size_t len = strlen(shell_vcard);
-		struct net_buf *buf = bt_opp_server_create_pdu(&g_shell_server_inst.server, NULL);
-
-		if (buf == NULL) {
-			shell_error(sh, "create PDU failed");
-			return -ENOMEM;
-		}
-
-		err = bt_obex_add_header_len(buf, (uint32_t)len);
-		if (err != 0) {
-			shell_error(sh, "Fail to add length header %d", err);
-			net_buf_unref(buf);
-			return err;
-		}
-
-		err = bt_obex_add_header_end_body(buf, (uint16_t)len, (const uint8_t *)shell_vcard);
-		if (err != 0) {
-			shell_error(sh, "Fail to add end-of-body header %d", err);
-			net_buf_unref(buf);
-			return err;
-		}
-
-		err = bt_opp_server_pull(&g_shell_server_inst.server, BT_OPP_RSP_CODE_SUCCESS,
-					     buf);
-		if (err != 0) {
-			net_buf_unref(buf);
-		}
-	} else {
-		err = bt_opp_server_pull(&g_shell_server_inst.server, rsp_code, NULL);
+	/*
+	 * IrOBEX 1.2 section 3.3.2: a disconnect may not be refused. The only
+	 * other response code the section allows is "Service Unavailable", for
+	 * a request that carries invalid information. The application may send
+	 * it, and opp_server_obex_disconnect_cb() sends it on its own for a
+	 * Connection Id that the OBEX layer did not already answer with
+	 * "Not Found", see opp_req_has_conn_id().
+	 */
+	if (rsp_code != BT_OPP_RSP_CODE_SUCCESS && rsp_code != BT_OPP_RSP_CODE_UNAVAIL) {
+		LOG_ERR("A disconnect request cannot be refused with rsp 0x%02x", rsp_code);
+		return -EINVAL;
 	}
 
+	if (opp_has_excluded_header(buf)) {
+		return -EINVAL;
+	}
+
+	/*
+	 * Publish a successful disconnect before sending its response. The
+	 * transport may be torn down while the response is being sent, so only
+	 * roll back if this operation still owns the state.
+	 */
+	if (rsp_code == BT_OPP_RSP_CODE_SUCCESS) {
+		if (!atomic_cas(&server->_state, BT_OPP_STATE_CONNECTED,
+				BT_OPP_STATE_DISCONNECTING)) {
+			return -ENOTCONN;
+		}
+
+		prev_push_state = atomic_clear(&server->_push_state);
+		prev_pull_state = atomic_clear(&server->_pull_state);
+		disconnecting = true;
+	}
+
+	err = bt_obex_disconnect_rsp(&server->_server, rsp_code, buf);
 	if (err != 0) {
-		shell_error(sh, "pull rsp failed (err %d)", err);
+		if (disconnecting) {
+			if (atomic_cas(&server->_state, BT_OPP_STATE_DISCONNECTING,
+				       BT_OPP_STATE_CONNECTED)) {
+				(void)atomic_cas(&server->_push_state, 0, prev_push_state);
+				(void)atomic_cas(&server->_pull_state, 0, prev_pull_state);
+			}
+		}
+
 		return err;
 	}
 
-	shell_print(sh, "OPP server pull rsp sent (0x%02x)", rsp_code);
+	/*
+	 * The OBEX connection is torn down when the request is accepted. A
+	 * "Service Unavailable" response rejects a malformed request, which
+	 * leaves the connection as it was.
+	 */
+	if (disconnecting) {
+		(void)atomic_cas(&server->_state, BT_OPP_STATE_DISCONNECTING,
+				 BT_OPP_STATE_DISCONNECTED);
+	}
+
 	return 0;
 }
 
-/* opp server_abort_rsp - respond to abort */
-static int cmd_opp_server_abort_rsp(const struct shell *sh, size_t argc, char *argv[])
+int bt_opp_server_push(struct bt_opp_server *server, uint8_t rsp_code, struct net_buf *buf)
 {
+	atomic_val_t prev = 0;
+	bool ended;
 	int err;
 
-	if (!g_shell_server_inst.in_use) {
-		shell_error(sh, "No active server connection");
-		return -ENODEV;
+	if (server == NULL) {
+		return -EINVAL;
 	}
 
-	err = bt_opp_server_abort(&g_shell_server_inst.server, BT_OPP_RSP_CODE_SUCCESS, NULL);
+	if (opp_has_excluded_header(buf)) {
+		return -EINVAL;
+	}
+
+	/*
+	 * CONTINUE asks the client for the next packet of the same push
+	 * operation. Any other response code ends it, so the next push has to
+	 * name its object again before the object body.
+	 *
+	 * Publish that before the response is sent. The next request is handled
+	 * in the RX thread, which may run before bt_obex_put_rsp() has returned
+	 * to this thread, and it has to be checked as part of a new push
+	 * operation, not against the Name header and body of the ended one.
+	 */
+	ended = rsp_code != BT_OPP_RSP_CODE_CONTINUE;
+	if (ended) {
+		prev = atomic_clear(&server->_push_state);
+	}
+
+	err = bt_obex_put_rsp(&server->_server, rsp_code, buf);
 	if (err != 0) {
-		shell_error(sh, "abort rsp failed (err %d)", err);
+		/*
+		 * Nothing has been sent, so the operation is still ongoing.
+		 * Only undo the transition made above: the transport may have
+		 * been torn down in the meantime, in which case the
+		 * disconnected callback already published the final state.
+		 */
+		if (ended) {
+			(void)atomic_cas(&server->_push_state, 0, prev);
+		}
+
 		return err;
 	}
 
-	shell_print(sh, "OPP server abort rsp sent");
 	return 0;
 }
 
-#endif /* CONFIG_BT_OPP_SERVER */
+int bt_opp_server_pull(struct bt_opp_server *server, uint8_t rsp_code, struct net_buf *buf)
+{
+	atomic_val_t prev = 0;
+	bool ended;
+	int err;
 
-SHELL_STATIC_SUBCMD_SET_CREATE(
-	opp_cmds,
-#if defined(CONFIG_BT_OPP_CLIENT)
-	SHELL_CMD_ARG(discover, NULL, "Discover OPP service RFCOMM channel via SDP",
-		      cmd_opp_discover, 1, 0),
-	SHELL_CMD_ARG(transport_connect, NULL, "Connect RFCOMM using SDP-discovered channel",
-		      cmd_opp_transport_connect, 1, 0),
-	SHELL_CMD_ARG(transport_disconnect, NULL, "Disconnect RFCOMM", cmd_opp_transport_disconnect,
-		      1, 0),
-	SHELL_CMD_ARG(connect, NULL, "[mopl]  Establish OBEX connection", cmd_opp_connect, 1, 1),
-	SHELL_CMD_ARG(disconnect, NULL, "Terminate OBEX connection", cmd_opp_disconnect, 1, 0),
-	SHELL_CMD_ARG(push, NULL, "<vcard|vcal|vnote|vmsg>  Push a demo object to the server",
-		      cmd_opp_push, 2, 0),
-	SHELL_CMD_ARG(pull, NULL, "Pull the server's default business card", cmd_opp_pull, 1, 0),
-	SHELL_CMD_ARG(exchange, NULL, "Business Card Exchange: push own vCard then pull server's",
-		      cmd_opp_exchange, 1, 0),
-	SHELL_CMD_ARG(abort, NULL, "Abort the current operation", cmd_opp_abort, 1, 0),
-#endif /* CONFIG_BT_OPP_CLIENT */
-#if defined(CONFIG_BT_OPP_SERVER)
-	SHELL_CMD_ARG(server_register, NULL, "Register OPP Push Server (RFCOMM, OPP 1.1)",
-		      cmd_opp_server_register, 1, 0),
-	SHELL_CMD_ARG(server_connect_rsp, NULL,
-		      "[success|reject] [mopl]  Send OBEX CONNECT response",
-		      cmd_opp_server_connect_rsp, 1, 2),
-	SHELL_CMD_ARG(server_disconnect_rsp, NULL, "Send OBEX DISCONNECT response",
-		      cmd_opp_server_disconnect_rsp, 1, 0),
-	SHELL_CMD_ARG(server_push_rsp, NULL,
-		      "[continue|success|reject|toobig|unsupported]  Send PUT response "
-		      "(default: success if final, else continue)",
-		      cmd_opp_server_push_rsp, 1, 1),
-	SHELL_CMD_ARG(server_pull_rsp, NULL,
-			      "[continue|success|reject|notfound]  Send GET response for business card pull",
-		      cmd_opp_server_pull_rsp, 1, 1),
-	SHELL_CMD_ARG(server_abort_rsp, NULL, "Send ABORT response", cmd_opp_server_abort_rsp, 1,
-		      0),
-#endif /* CONFIG_BT_OPP_SERVER */
-	SHELL_SUBCMD_SET_END);
+	if (server == NULL) {
+		return -EINVAL;
+	}
 
-SHELL_CMD_REGISTER(opp, &opp_cmds, "Bluetooth OPP shell commands", NULL);
+	if (opp_has_excluded_header(buf)) {
+		return -EINVAL;
+	}
+
+	/*
+	 * OPP spec Table 5.3 makes the End-of-Body header mandatory, and per
+	 * IrOBEX 1.2 section 2.2.9 it carries the last chunk of the object,
+	 * which is what a success response concludes the pull operation with.
+	 * Any other response code either asks for another chunk or rejects the
+	 * request.
+	 */
+	if (rsp_code == BT_OPP_RSP_CODE_SUCCESS &&
+	    !bt_obex_has_header(buf, BT_OBEX_HEADER_ID_END_BODY)) {
+		LOG_ERR("OBEX header (End of Body) is missing");
+		return -ENODATA;
+	}
+
+	ended = rsp_code != BT_OPP_RSP_CODE_CONTINUE;
+	if (ended) {
+		prev = atomic_clear(&server->_pull_state);
+	}
+
+	err = bt_obex_get_rsp(&server->_server, rsp_code, buf);
+	if (err != 0 && ended) {
+		(void)atomic_cas(&server->_pull_state, 0, prev);
+	}
+
+	return err;
+}
+
+int bt_opp_server_abort(struct bt_opp_server *server, uint8_t rsp_code, struct net_buf *buf)
+{
+	if (server == NULL) {
+		return -EINVAL;
+	}
+
+	/*
+	 * IrOBEX 1.2 section 3.3.5: the response to an abort is success,
+	 * indicating that the abort was received and that the server is
+	 * resynchronized with the client. A client that gets anything else
+	 * should disconnect, so there is nothing to gain from sending it.
+	 */
+	if (rsp_code != BT_OPP_RSP_CODE_SUCCESS) {
+		LOG_ERR("An abort request cannot be answered with rsp 0x%02x", rsp_code);
+		return -EINVAL;
+	}
+
+	if (opp_has_excluded_header(buf)) {
+		return -EINVAL;
+	}
+
+	return bt_obex_abort_rsp(&server->_server, rsp_code, buf);
+}
+
+#endif /* CONFIG_BT_OPP_SERVER */
